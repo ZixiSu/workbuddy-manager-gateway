@@ -1,0 +1,43 @@
+# Python / build tools
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Private runtime state, credentials and task artifacts
+.env
+.env.*
+!.env.example
+state/
+.state/
+data/
+work/
+outputs/
+logs/
+*.log
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.pid
+*.token
+credentials.json
+connection.json
+local-config.json
+
+# Local editor / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
