@@ -3,71 +3,18 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import secrets
 import threading
 import time
 import uuid
 from contextlib import ExitStack
-from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
 from .acp import AcpClient, AcpError
 from .discovery import discover
+from .redact import error_summary, protocol_errors, safe_text, sanitize
 from .runtime import state_directory, worker_lock
-from .store import Store
+from .store import BACKEND_DESKTOP, Store
 
-
-def safe_text(value: str) -> str:
-    value = re.sub(r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?(?:(?:bearer|basic)\s+)?)[^\s,\"']+", r"\1[REDACTED]", value)
-    value = re.sub(r"(?i)((?:access_token|refresh_token|client_secret|api_key|password|sessionToken|ticket|token)\s*[\"']?\s*[:=]\s*[\"']?)[^\s,\"']+", r"\1[REDACTED]", value)
-    value = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b", "[REDACTED]", value)
-    def scrub_url(match):
-        try:
-            url = urlsplit(match[0])
-            if url.query or url.fragment or url.username or url.password:
-                return urlunsplit((url.scheme, url.hostname or "", url.path, "[REDACTED]", ""))
-        except ValueError:
-            return "[REDACTED_URL]"
-        return match[0]
-    return re.sub(r"https?://[^\s<>\"']+", scrub_url, value)
-
-
-def sanitize(value):
-    if isinstance(value, dict):
-        return {key: "[REDACTED]" if re.search(r"(?i)^(?:authorization|password|token|ticket|access_?token|refresh_?token|session_?token|api_?key|client_?secret)$", str(key))
-                else sanitize(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [sanitize(item) for item in value]
-    return safe_text(value) if isinstance(value, str) else value
-
-
-def error_summary(value):
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            return safe_text(value)[:4000]
-    if isinstance(value, dict):
-        return {key: error_summary(item) for key, item in value.items()
-                if key in {"code", "message", "category", "httpStatus", "status", "bizCode", "reason", "error", "type"}}
-    return value if value is None or isinstance(value, (int, float, bool)) else "Error details omitted"
-
-
-def protocol_errors(value):
-    found = []
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if "error" in str(key).lower() and item:
-                summary = error_summary(item)
-                if summary:
-                    found.append(summary)
-            elif isinstance(item, (dict, list)):
-                found.extend(protocol_errors(item))
-    elif isinstance(value, list):
-        for item in value:
-            found.extend(protocol_errors(item))
-    return found[:10]
+__all__ = ["execute", "run_task", "safe_text", "sanitize", "prompt_for", "run_worker"]
 
 
 def prompt_for(task: dict) -> str:
@@ -212,6 +159,11 @@ def execute(store: Store, task: dict, discovery: dict | None = None):
         command = [environment["node"], environment["cli"], "--acp", "--permission-mode", "default"]
         if environment.get("force_lite_wb"):
             command += ["--serve", "--acp-transport", "stdio", "--host", "127.0.0.1", "--port", "0", "--setting-sources", "none"]
+            effort = os.environ.get("BUDDYGATE_CLI_EFFORT")
+            if effort:
+                if effort not in ("minimal", "low", "medium", "high", "xhigh", "max"):
+                    raise ValueError("Unsupported WorkBuddy reasoning effort")
+                command += ["--effort", effort]
         if selected_model:
             command += ["--model", selected_model]
         client = AcpClient(command, task["workspace"], on_update, on_permission, env)
@@ -291,6 +243,14 @@ def execute(store: Store, task: dict, discovery: dict | None = None):
         resources.close()
 
 
+def run_task(store: Store, task: dict, discovery: dict | None = None, desktop=None, connection=None) -> dict:
+    """Dispatch by the persisted backend. There is no automatic fallback."""
+    if task.get("backend") == BACKEND_DESKTOP:
+        from .desktop_exec import execute_desktop
+        return execute_desktop(store, task, client=desktop, connection=connection)
+    return execute(store, task, discovery)
+
+
 def _run_locked(directory, once, idle_exit):
     store = Store(directory / "tasks.sqlite3")
     (directory / "stop.request").write_text("", encoding="utf-8")
@@ -302,7 +262,7 @@ def _run_locked(directory, once, idle_exit):
             return {"executed": count, "stopped": True}
         task = store.claim_next(str(os.getpid()))
         if task:
-            execute(store, task)
+            run_task(store, task)
             count += 1
         if once or (not task and idle_exit):
             return {"executed": count, "recovered_as_uncertain": recovered}

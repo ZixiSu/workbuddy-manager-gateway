@@ -81,9 +81,8 @@ def _default_installations() -> list[tuple[Path, str | None]]:
     for variable in ("ProgramFiles", "ProgramFiles(x86)"):
         if os.environ.get(variable):
             candidates.append((Path(os.environ[variable]) / "WorkBuddy", None))
-    if os.name == "nt":
-        # An additional finite candidate, not a requirement or a filesystem scan.
-        candidates.append((Path("D:/workbuddy"), None))
+    # A non-standard install location must be given explicitly (WORKBUDDY_HOME or
+    # BUDDYGATE_CLI); no drive letter or user path is baked into the source.
     return candidates
 
 

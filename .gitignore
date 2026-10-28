@@ -41,3 +41,6 @@ local-config.json
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Assistant workspace notes (private, never published)
+.workbuddy/

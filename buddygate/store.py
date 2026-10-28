@@ -20,8 +20,14 @@ STATUSES = frozenset({
 ACTIVE_STATUSES = frozenset({"running", "waiting_permission", "cancel_requested", "uncertain"})
 _MUTABLE = frozenset({
     "status", "session_id", "feedback", "result", "error", "permission",
-    "worker_id", "stop_confirmed", "model", "timeout_seconds",
+    "worker_id", "stop_confirmed", "model", "timeout_seconds", "native", "usage",
 })
+
+# A visible desktop conversation is the default. The independent CLI session is
+# an explicitly requested compatibility mode and is never chosen automatically.
+BACKEND_DESKTOP = "desktop_visible"
+BACKEND_CLI = "cli_acp"
+BACKENDS = frozenset({BACKEND_DESKTOP, BACKEND_CLI})
 
 
 def _now() -> str:
@@ -60,6 +66,42 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS events_by_task ON events(task_id,id);
             """)
+            self._migrate(db)
+
+    @staticmethod
+    def _migrate(db: sqlite3.Connection) -> None:
+        """Add the backend column and normalise legacy bodies in place.
+
+        Tasks recorded before the desktop backend existed keep their original
+        meaning: an independent CLI/ACP session, not a visible conversation.
+        Their identifiers, fingerprints and statuses are not rewritten.
+        """
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
+        if "backend" not in columns:
+            db.execute("ALTER TABLE tasks ADD COLUMN backend TEXT")
+        rows = list(db.execute("SELECT id,body,backend FROM tasks"))
+        if not rows:
+            return
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            for row in rows:
+                body = json.loads(row["body"])
+                changed = False
+                if body.get("backend") not in BACKENDS:
+                    body["backend"] = BACKEND_CLI
+                    changed = True
+                for name in ("native", "usage", "codex_thread"):
+                    if name not in body:
+                        body[name] = None
+                        changed = True
+                if changed:
+                    db.execute("UPDATE tasks SET body=? WHERE id=?", (_json(body), row["id"]))
+                if row["backend"] != body["backend"]:
+                    db.execute("UPDATE tasks SET backend=? WHERE id=?", (body["backend"], row["id"]))
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -114,7 +156,8 @@ class Store:
 
     def submit_task(self, workspace: str, objective: str, constraints: list[str] | None = None,
                     idempotency_key: str | None = None, model: str | None = None,
-                    timeout_seconds: int = 900) -> dict:
+                    timeout_seconds: int = 900, backend: str = BACKEND_DESKTOP,
+                    codex_thread: str | None = None) -> dict:
         directory = Path(workspace).expanduser()
         if not directory.is_absolute() or not directory.is_dir():
             raise ValueError("workspace must be an existing absolute directory")
@@ -131,23 +174,35 @@ class Store:
             raise ValueError("timeout_seconds must be a positive integer")
         if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key.strip()):
             raise ValueError("idempotency_key must be nonempty text or None")
+        if backend not in BACKENDS:
+            raise ValueError("backend must be one of: " + ", ".join(sorted(BACKENDS)))
+        if codex_thread is not None:
+            if not isinstance(codex_thread, str) or not codex_thread.strip():
+                raise ValueError("codex_thread must be an existing absolute file path or None")
+            candidate = Path(codex_thread).expanduser()
+            if not candidate.is_absolute() or not candidate.is_file():
+                raise ValueError("codex_thread must be an existing absolute file path or None")
+            codex_thread = str(candidate.resolve())
         request = {"workspace": workspace, "objective": objective, "constraints": constraints,
-                   "model": model, "timeout_seconds": timeout_seconds}
+                   "model": model, "timeout_seconds": timeout_seconds, "backend": backend,
+                   "codex_thread": codex_thread}
         fingerprint = hashlib.sha256(_json(request).encode("utf-8")).hexdigest()
         with self._transaction() as db:
             if idempotency_key is not None:
                 row = db.execute("SELECT fingerprint,body FROM tasks WHERE idempotency_key=?", (idempotency_key,)).fetchone()
                 if row is not None:
                     if row["fingerprint"] != fingerprint:
-                        raise ValueError("idempotency_key belongs to a different request")
+                        raise ValueError("idempotency_key belongs to a different request (backend is part of the request identity)")
                     return json.loads(row["body"])
             now = _now()
             task = {"id": f"task-{uuid.uuid4()}", **request, "constraints": list(constraints),
                     "attempt": 1, "status": "queued", "session_id": None, "feedback": "",
                     "result": None, "error": None, "permission": None, "worker_id": None,
+                    "native": None, "usage": None,
                     "stop_confirmed": False, "created_at": now, "updated_at": now}
-            db.execute("INSERT INTO tasks VALUES(?,?,?,?)", (task["id"], idempotency_key, fingerprint, _json(task)))
-            self._event(db, task["id"], "submitted", {"status": "queued", "attempt": 1})
+            db.execute("INSERT INTO tasks(id,idempotency_key,fingerprint,body,backend) VALUES(?,?,?,?,?)",
+                       (task["id"], idempotency_key, fingerprint, _json(task), backend))
+            self._event(db, task["id"], "submitted", {"status": "queued", "attempt": 1, "backend": backend})
             return task
 
     def get_task(self, id: str) -> dict:
@@ -184,6 +239,9 @@ class Store:
             raise ValueError("timeout_seconds must be a positive integer")
         if "model" in changes and changes["model"] is not None and (not isinstance(changes["model"], str) or not changes["model"].strip()):
             raise ValueError("model must be a nonempty string or None")
+        for name in ("native", "usage"):
+            if name in changes and changes[name] is not None and not isinstance(changes[name], dict):
+                raise ValueError(f"{name} must be a dictionary or None")
         _json(changes)
         with self._transaction() as db:
             task = self._get(db, id)
@@ -258,9 +316,25 @@ class Store:
             task = self._get(db, id)
             if task["status"] not in {"needs_review", "failed", "blocked", "cancelled"} or not task["stop_confirmed"]:
                 raise ValueError("Rework requires a finished task and explicit stopped confirmation")
-            previous = {"attempt": task["attempt"], "status": task["status"], "result": task["result"], "error": task["error"]}
+            previous = {"attempt": task["attempt"], "status": task["status"], "result": task["result"],
+                        "error": task["error"], "usage": task.get("usage")}
+            native = dict(task.get("native") or {})
+            if native:
+                # Reuse the same visible conversation, but a new attempt must
+                # reserve a new request ID before anything is dispatched again.
+                native.update(dispatch=None, request_id=None, attempt=task["attempt"] + 1)
+                native.pop("sent_at", None)
+                # The previous attempt's canonical request id belongs to another
+                # request: keeping it would misattribute this attempt's usage and
+                # could match the wrong request while observing.
+                for stale in ("native_request_id", "native_request_id_source",
+                              "native_request_id_matched_by", "native_request_id_saved_at",
+                              "native_request_identity_conflict", "client_request_id_missing",
+                              "activity"):
+                    native.pop(stale, None)
             task.update(attempt=task["attempt"] + 1, status="queued", feedback=feedback,
-                        result=None, error=None, permission=None, worker_id=None, stop_confirmed=False)
+                        result=None, error=None, permission=None, worker_id=None, stop_confirmed=False,
+                        native=native or None, usage=None)
             return self._save(db, task, "rework", {"previous": previous, "feedback": feedback, "attempt": task["attempt"]})
 
     def accept_task(self, id: str, note: str, evidence: list[str]) -> dict:
@@ -289,12 +363,32 @@ class Store:
             return self._save(db, task, "cancel_requested", {"attempt": task["attempt"], "remote_stopped": task["stop_confirmed"]})
 
     def recover_interrupted(self) -> int:
+        """Mark interrupted attempts as unreconciled. They are never resent.
+
+        This does **not** resume observing a request that may already have been
+        dispatched: the gateway has no proof the prompt arrived, so it stops,
+        records the boundary (``observation_resumed: False``) and requires the
+        manager to inspect the visible conversation before any new attempt.
+        """
         recovered = 0
         with self._transaction() as db:
             for task in self._all(db):
                 if task["status"] in {"running", "waiting_permission", "cancel_requested"}:
+                    native = dict(task.get("native") or {})
+                    if native:
+                        # The gateway cannot know whether the desktop accepted the
+                        # prompt. Mark it unreconciled so no restart resends it.
+                        native["dispatch"] = "unknown"
+                        native["observation_resumed"] = False
                     task.update(status="uncertain", stop_confirmed=False,
-                                error="Gateway interrupted execution. Inspect the original WorkBuddy session and confirm it stopped; task was not replayed.")
-                    self._save(db, task, "interrupted", {"attempt": task["attempt"], "replayed": False})
+                                native=native or None,
+                                error="Gateway interrupted execution. The prompt was not resent and observation "
+                                      "was not resumed; inspect the original WorkBuddy conversation and confirm it "
+                                      "stopped before any rework.")
+                    self._save(db, task, "interrupted", {
+                        "attempt": task["attempt"], "replayed": False, "prompt_resent": False,
+                        "observation_resumed": False,
+                        "conversation_id": (task.get("native") or {}).get("conversation_id"),
+                    })
                     recovered += 1
         return recovered

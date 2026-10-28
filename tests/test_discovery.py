@@ -1,5 +1,6 @@
 """Discovery must use installation metadata without executing an agent."""
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,27 @@ from unittest.mock import patch
 import uuid
 
 from buddygate.discovery import _display_icon_path, discover
+
+# Only discovery's own variables are removed and restored. Inherited Windows
+# variables (which may exceed the 32767-character putenv limit) are never
+# cleared, so patch.dict(..., clear=True) must not be used here.
+_DISCOVERY_ENV_VARS = ("BUDDYGATE_NODE", "BUDDYGATE_CLI", "WORKBUDDY_CLI_PATH", "WORKBUDDY_HOME")
+
+
+@contextlib.contextmanager
+def discovery_env(overrides: dict[str, str]):
+    saved: dict[str, str] = {}
+    for name in _DISCOVERY_ENV_VARS:
+        if name in os.environ:
+            saved[name] = os.environ.pop(name)
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name in overrides:
+            os.environ.pop(name, None)
+        for name, value in saved.items():
+            os.environ[name] = value
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -39,7 +61,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_explicit_paths_take_precedence_and_read_packaged_version(self):
         _, cli = self.make_installation()
-        with patch.dict(os.environ, {"BUDDYGATE_NODE": str(self.node), "BUDDYGATE_CLI": str(cli)}, clear=True), patch("buddygate.discovery._default_installations", side_effect=AssertionError("must not search")), patch("buddygate.discovery.shutil.which", side_effect=AssertionError("must not search")):
+        with discovery_env({"BUDDYGATE_NODE": str(self.node), "BUDDYGATE_CLI": str(cli)}), patch("buddygate.discovery._default_installations", side_effect=AssertionError("must not search")), patch("buddygate.discovery.shutil.which", side_effect=AssertionError("must not search")):
             found = discover()
         self.assertTrue(found["supported"])
         self.assertEqual(found["cli"], str(cli.resolve()))
@@ -49,7 +71,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_invalid_explicit_cli_does_not_fall_back(self):
         installation, _ = self.make_installation()
-        with patch.dict(os.environ, {"BUDDYGATE_NODE": str(self.node), "BUDDYGATE_CLI": str(self.root / "missing")}, clear=True), patch("buddygate.discovery._default_installations", return_value=[(installation, None)]) as search:
+        with discovery_env({"BUDDYGATE_NODE": str(self.node), "BUDDYGATE_CLI": str(self.root / "missing")}), patch("buddygate.discovery._default_installations", return_value=[(installation, None)]) as search:
             found = discover()
         self.assertFalse(found["supported"])
         self.assertIsNone(found["cli"])
@@ -58,21 +80,21 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_documented_cli_variable_precedes_alias(self):
         _, cli = self.make_installation()
-        with patch.dict(os.environ, {"BUDDYGATE_NODE": str(self.node), "WORKBUDDY_CLI_PATH": str(cli), "BUDDYGATE_CLI": str(self.root / "missing")}, clear=True):
+        with discovery_env({"BUDDYGATE_NODE": str(self.node), "WORKBUDDY_CLI_PATH": str(cli), "BUDDYGATE_CLI": str(self.root / "missing")}):
             found = discover()
         self.assertTrue(found["supported"])
         self.assertEqual(found["cli"], str(cli.resolve()))
 
     def test_explicit_installation_root_precedes_default_locations(self):
         installation, cli = self.make_installation()
-        with patch.dict(os.environ, {"BUDDYGATE_NODE": str(self.node), "WORKBUDDY_HOME": str(installation)}, clear=True), patch("buddygate.discovery._default_installations", side_effect=AssertionError("must not search")):
+        with discovery_env({"BUDDYGATE_NODE": str(self.node), "WORKBUDDY_HOME": str(installation)}), patch("buddygate.discovery._default_installations", side_effect=AssertionError("must not search")):
             found = discover()
         self.assertTrue(found["supported"])
         self.assertEqual(found["cli"], str(cli.resolve()))
 
     def test_invalid_explicit_node_does_not_fall_back(self):
         _, cli = self.make_installation()
-        with patch.dict(os.environ, {"BUDDYGATE_NODE": str(self.root / "missing"), "BUDDYGATE_CLI": str(cli)}, clear=True), patch("buddygate.discovery.shutil.which", return_value=str(self.node)) as search:
+        with discovery_env({"BUDDYGATE_NODE": str(self.root / "missing"), "BUDDYGATE_CLI": str(cli)}), patch("buddygate.discovery.shutil.which", return_value=str(self.node)) as search:
             found = discover()
         self.assertFalse(found["supported"])
         self.assertIsNone(found["node"])
@@ -80,7 +102,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_registry_candidate_and_node_on_path(self):
         installation, cli = self.make_installation(lite=False)
-        with patch.dict(os.environ, {}, clear=True), patch("buddygate.discovery._registry_installations", return_value=[(self.root / "missing", None), (installation, "5.8.3")]), patch("buddygate.discovery.shutil.which", return_value=str(self.node)):
+        with discovery_env({}), patch("buddygate.discovery._registry_installations", return_value=[(self.root / "missing", None), (installation, "5.8.3")]), patch("buddygate.discovery.shutil.which", return_value=str(self.node)):
             found = discover()
         self.assertTrue(found["supported"])
         self.assertEqual(found["cli"], str(cli.resolve()))
@@ -88,7 +110,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertFalse(found["force_lite_wb"])
 
     def test_missing_installation_has_useful_errors(self):
-        with patch.dict(os.environ, {}, clear=True), patch("buddygate.discovery._default_installations", return_value=[]), patch("buddygate.discovery.shutil.which", return_value=None):
+        with discovery_env({}), patch("buddygate.discovery._default_installations", return_value=[]), patch("buddygate.discovery.shutil.which", return_value=None):
             found = discover()
         self.assertFalse(found["supported"])
         self.assertEqual(len(found["errors"]), 2)
@@ -97,7 +119,7 @@ class DiscoveryTests(unittest.TestCase):
     def test_malformed_package_metadata_does_not_hide_valid_paths(self):
         _, cli = self.make_installation()
         (cli.parent.parent / "package.json").write_text("not JSON", encoding="utf-8")
-        with patch.dict(os.environ, {"BUDDYGATE_NODE": str(self.node), "BUDDYGATE_CLI": str(cli)}, clear=True):
+        with discovery_env({"BUDDYGATE_NODE": str(self.node), "BUDDYGATE_CLI": str(cli)}):
             found = discover()
         self.assertTrue(found["supported"])
         self.assertIsNone(found["version"])

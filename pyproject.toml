@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workbuddy-manager-gateway"
-version = "0.1.0"
+version = "0.3.0"
 description = "A durable local task gateway for a manager agent and the WorkBuddy executor"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -15,3 +15,6 @@ buddygate = "buddygate.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["buddygate*"]
+
+[tool.setuptools.package-data]
+buddygate = ["*.mjs"]

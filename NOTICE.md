@@ -4,6 +4,8 @@ WorkBuddy Manager Gateway 的网关代码为独立的 Python 标准库实现。�
 
 运行时通过已安装 WorkBuddy 自带的 `workbuddy_ipc` 库连接宿主的 `wb.request/http.fetch`，该厂商库及 WorkBuddy CLI 不包含在本项目分发内容中。临时本机转发使用本次进程生成的 nonce；账号登录鉴权仍由 WorkBuddy 宿主管理。
 
+桌面可见通路（`buddygate/desktop.py`、`buddygate/desktop_console.mjs`）是本项目自写实现：端口归属由操作系统 TCP 表与进程映像路径核验，renderer 操作通过本机 WebSocket 上的一次性 `Runtime.evaluate` 完成。所用 `wb:conversations:*` 调用形态来自对已安装应用的接口行为观察，未复制任何第三方仓库源码，也不包含账号状态、票据、日志或引导脚本。项目自写的 Node 辅助脚本仅使用 Node 内置模块，不随包附带厂商代码。
+
 | 参考 | 本项目使用的知识 | 审查时的许可信息 |
 | --- | --- | --- |
 | [BenjaminNH/workbuddy-subagent-bridge](https://github.com/BenjaminNH/workbuddy-subagent-bridge) | Node 启动内置 CLI 的 stdio ACP 路线、会话与权限事件的接口行为 | MIT |
