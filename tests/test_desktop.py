@@ -559,41 +559,83 @@ class ObservationTests(DesktopTestCase):
             {"optionId": "deny", "kind": "reject_once", "name": "拒绝一次"},
             {"optionId": "forever", "kind": "allow_always", "name": "总是允许"},
         ]}}
-        desktop = FakeDesktop(states=("running", "completed"), pending_value=pending)
+        granted = threading.Event()
+        polls = threading.Event()
+
+        class GatedDesktop(FakeDesktop):
+            """A real desktop cannot finish the turn while a permission is pending.
+
+            The turn stays ``running`` no matter how many observations happen, and
+            only a resolved one-time approval releases it to ``completed``. The
+            manager's decision timing therefore cannot decide the test outcome.
+            """
+
+            def __init__(inner, **kwargs):
+                super().__init__(states=("running",), on_poll=lambda _: polls.set(), **kwargs)
+                inner.completed_before_decision = 0
+
+            def observe(inner, conversation_id, request_id, native_request_id=None):
+                payload = super().observe(conversation_id, request_id, native_request_id)
+                if granted.is_set():
+                    payload.update(state="completed", assistant=inner.assistant, usage=inner.usage,
+                                   requestedModel={"id": "requested-model"},
+                                   responseModel={"id": "served-model"})
+                return payload
+
+            def resolve_pending(inner, conversation_id, pending_id, response):
+                result = super().resolve_pending(conversation_id, pending_id, response)
+                if (response or {}).get("optionId") == "once":
+                    granted.set()
+                return result
+
+        desktop = GatedDesktop(pending_value=pending)
         errors = []
 
         def executor():
             try:
-                execute_desktop(self.store, task, client=desktop, poll_interval=0.02)
+                execute_desktop(self.store, task, client=desktop, poll_interval=0.01)
             except BaseException as error:  # pragma: no cover - surfaced below
                 errors.append(error)
 
         thread = threading.Thread(target=executor)
         thread.start()
         try:
-            until = time.monotonic() + 8
             waiting = None
-            while time.monotonic() < until:
+            for _ in range(200):
                 waiting = self.store.get_task(task["id"])
                 if waiting["status"] == "waiting_permission":
                     break
-                time.sleep(0.02)
+                polls.wait(0.05)
             self.assertIsNotNone(waiting)
             self.assertEqual(waiting["status"], "waiting_permission")
             permission = waiting["permission"]
             self.assertEqual({item["kind"] for item in permission["options"]},
                              {"allow_once", "reject_once", "allow_always"})
             self.assertEqual(desktop.resolved, [], "nothing may be approved automatically")
+
+            # A manager who takes several more observation rounds to decide must
+            # still find a pending request: the gate, not the clock, holds it.
+            for _ in range(3):
+                polls.clear()
+                self.assertTrue(polls.wait(5), "the executor must keep observing while waiting")
+                self.assertEqual(self.store.get_task(task["id"])["status"], "waiting_permission")
+                self.assertEqual(desktop.resolved, [])
+                self.assertTrue(thread.is_alive(), "the executor must not finish before a decision")
+
             with self.assertRaisesRegex(ValueError, "one-time"):
                 self.store.decide_permission(task["id"], permission["id"], "forever", "不得永久授权")
             self.store.decide_permission(task["id"], permission["id"], "once", "用户授权本次写入")
         finally:
             thread.join(timeout=15)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(len(desktop.resolved), 1)
+        self.assertEqual(len(desktop.resolved), 1, "exactly one resolution, after the decision")
         self.assertEqual(desktop.resolved[0]["pending_id"], "pending-1")
         self.assertEqual(desktop.resolved[0]["response"], {"optionId": "once"})
         self.assertEqual(self.store.get_task(task["id"])["status"], "needs_review")
+        # A late approval must not be delivered once the request is already terminal.
+        with self.assertRaisesRegex(ValueError, "no longer pending"):
+            self.store.decide_permission(task["id"], permission["id"], "once", "迟到的批准")
 
     def test_unrecognised_permission_is_not_approved(self):
         task = self.claimed()

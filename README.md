@@ -1,6 +1,6 @@
 # WorkBuddy Manager Gateway
 
-让主 Agent 派工、检查成果和提出返工，让 WorkBuddy 在**真实可见的桌面聊天**里用自己的模型和工具执行。面向 Windows 的本地任务网关，版本 `0.4.0`。网关自有代码使用 Python 3.11+ 标准库；本地渲染器辅助脚本是项目自写的 Node ESM 文件（Node 22+ 内置 WebSocket）。
+让主 Agent 派工、检查成果和提出返工，让 WorkBuddy 在**真实可见的桌面聊天**里用自己的模型和工具执行。面向 Windows 的本地任务网关，版本 `0.4.1`。网关自有代码使用 Python 3.11+ 标准库；本地渲染器辅助脚本是项目自写的 Node ESM 文件（Node 22+ 内置 WebSocket）。
 
 ```text
 用户确定目标与授权
@@ -105,7 +105,7 @@ python -m buddygate accept TASK_ID --note '已检查实际输出' --evidence '�
 
 ## 一次调用等待（节省 Codex 轮次）
 
-旧的“提交后每隔几十秒 `sleep` + `get`”会为每次检查花掉一轮模型调用。0.4.0 增加“一次调用等到结果”：等待完全由 Python 本地读取同一个 SQLite 任务记录，**不调用任何模型**。
+旧的“提交后每隔几十秒 `sleep` + `get`”会为每次检查花掉一轮模型调用。0.4.x 增加“一次调用等到结果”：等待完全由 Python 本地读取同一个 SQLite 任务记录，**不调用任何模型**。
 
 ```powershell
 python -m buddygate run --workspace 'D:\GatewayDemo' --objective '...' --key 'demo-001' --wait-seconds 1800
@@ -147,6 +147,20 @@ python scripts/benchmark_wait.py --task-id TASK_ID --duration 120
 ```
 
 它在同一个真实任务上同时取样：旧式定时 `get` 轮询的读取次数，与新等待路径的轮询次数、结果和是否一次结束。脚本自身**不提交任务、不调用模型**；输出的读取次数**不是** Token 节省，只有主 Agent 线程的 `token_count` 在窗口内不增长才能证明等待期没有新增计数。
+
+### 实测：等待期零轮次，但总体未必更省
+
+经理独立做过一组同输入、同验收标准的 A/B（两篇 1000–1500 字任务），数字如下，本项目只转述：
+
+| 口径 | 等待 | 模型用量事件 | 输入 | 输出 | 合计 |
+| --- | --- | --- | --- | --- | --- |
+| `buddy_run` / `rework_and_wait` | 140.719 s / 87.953 s | 等待期 Codex 输入、输出与 `token_count` 事件**均为 0 增量** | — | — | — |
+| A：Codex 独做 | — | 2 | 535512 | 2727 | 538239 |
+| B：委派 WorkBuddy（一次事实返工后验收） | — | 4 | 1096640 | 2955 | 1099595 |
+
+B 的合计比 A 多 **104.295%**（即 A 的 **204.295%**），**这一轮并没有省 Token**。
+
+结论要分清：本机制省的是**等待期间的 Codex 轮次**（旧做法每几十秒一次 `sleep`+`get` 就是一轮模型调用），它不等于省总 Token——委派会把读文件、写返工、独立验收的上下文搬到 Codex 侧，返工还会翻倍。上面是**单对顺序样本**，受长上下文与缓存命中漂移影响，不能外推成账单结论或所有任务的结论。
 
 ## 用量分账
 
@@ -242,7 +256,7 @@ CI 覆盖 Windows、Ubuntu 的 Python 3.11/3.12 标准库测试，并对渲染�
 公开文件白名单见 [PUBLISH_MANIFEST.txt](docs/PUBLISH_MANIFEST.txt)，每行一个仓库相对路径。打包或上传前检查这些文件的实际内容，并核对清单已涵盖最终源文件与测试（含 `buddygate/desktop_console.mjs`、`buddygate/usage_ledger.py`、`scripts/check_desktop_helper.mjs` 与 `tests/test_usage_ledger.py`）。不要直接压缩整个工作目录；缓存、状态、任务日志、凭据和用户成果不属于发布内容。
 
 ```powershell
-python scripts/package.py --output '..\workbuddy-manager-gateway-0.4.0.zip'
+python scripts/package.py --output '..\workbuddy-manager-gateway-0.4.1.zip'
 python scripts/publish_to_github.py --owner VERIFIED_OWNER --repo workbuddy-manager-gateway --check
 ```
 
