@@ -1,6 +1,6 @@
 # WorkBuddy Manager Gateway
 
-让主 Agent 派工、检查成果和提出返工，让 WorkBuddy 在**真实可见的桌面聊天**里用自己的模型和工具执行。面向 Windows 的本地任务网关，版本 `0.3.1`。网关自有代码使用 Python 3.11+ 标准库；本地渲染器辅助脚本是项目自写的 Node ESM 文件（Node 22+ 内置 WebSocket）。
+让主 Agent 派工、检查成果和提出返工，让 WorkBuddy 在**真实可见的桌面聊天**里用自己的模型和工具执行。面向 Windows 的本地任务网关，版本 `0.4.0`。网关自有代码使用 Python 3.11+ 标准库；本地渲染器辅助脚本是项目自写的 Node ESM 文件（Node 22+ 内置 WebSocket）。
 
 ```text
 用户确定目标与授权
@@ -17,6 +17,7 @@ WorkBuddy 桌面应用：新增可见聊天，用自己的模型与工具执行
 ## 当前边界
 
 - **默认后端是 `desktop_visible`**：在 WorkBuddy 桌面端新建一个真实聊天并派发任务，聊天出现在桌面历史里，用户可以像平常一样看见过程和结果。
+- **一次调用等待，等待期间不花 Codex 轮次**：`buddy_run` 提交后在 Python 本地读任务记录，直到可以复核或需要处理才返回。返回值只是“可复核”，不是验收；超时只结束观察，不取消任务、不重发。
 - **独立 CLI 会话只作为明确标注的兼容模式**（`--backend cli_acp`）。网关**不会自动回退**：桌面通路不可用时任务进入 `blocked`/`uncertain` 并说明原因，不会偷偷改用隐藏会话。
 - 网关只连接**操作系统上报为 WorkBuddy 可执行文件所有、且仅绑定 `127.0.0.1`** 的调试端口，并且只在**恰好一个**通过身份探测（`__wbInvoke` + 应用版本 + `win32`）的原生 renderer 上操作。不使用 Chrome、不使用全局键盘鼠标、不接管前台窗口。
 - 端口归属核验**只实现于 Windows**（TCP 表 + 进程映像路径）。其他平台可以运行模拟测试，但不宣称支持。
@@ -90,7 +91,7 @@ python -m buddygate events TASK_ID         # 工具级事件（不含私有思�
 python -m buddygate rework TASK_ID --feedback '在原结果中补充排除的无效记录数，其余字段保持不变。'
 ```
 
-`get`/`list`/`status` 默认只给摘要，不重复整段提示词和工具流水。需要细节时读 `events`。
+`get`/`list`/`status` 默认只给摘要，不重复整段提示词和工具流水。需要细节时读 `events`。任务还在跑时用 `wait` 等待，不要用 `get` 反复轮询。
 
 摘要里的 `acceptance` 如实反映记录状态：`accepted_by_manager` 表示**主 Agent 自己记录了验收**（说明与证据在 `accepted` 事件里），网关既不代验收，也不验证业务正确性；`needs_review` 只表示“待复核”。
 
@@ -101,6 +102,51 @@ python -m buddygate accept TASK_ID --note '已检查实际输出' --evidence '�
 ```
 
 `accept` 只记录检查结论，不替主 Agent 核对业务内容。任务受理成功、协议握手或文件非空，都不能证明任务完成。
+
+## 一次调用等待（节省 Codex 轮次）
+
+旧的“提交后每隔几十秒 `sleep` + `get`”会为每次检查花掉一轮模型调用。0.4.0 增加“一次调用等到结果”：等待完全由 Python 本地读取同一个 SQLite 任务记录，**不调用任何模型**。
+
+```powershell
+python -m buddygate run --workspace 'D:\GatewayDemo' --objective '...' --key 'demo-001' --wait-seconds 1800
+python -m buddygate wait TASK_ID --wait-seconds 1800
+python -m buddygate rework-and-wait TASK_ID --feedback '...' --wait-seconds 1800
+```
+
+MCP 侧对应 `buddy_run`、`buddy_wait`、`buddy_rework_and_wait`。日常派工优先 `buddy_run`：一次工具调用内提交并等待，返回一份紧凑摘要；结果回来后再读实际文件验收，**不要每隔几十秒调用 `buddy_get`**。
+
+| `outcome` | 含义 | 是否结束等待 |
+| --- | --- | --- |
+| `ready_for_review` | `needs_review` 且 `stop_confirmed=true` | 是 |
+| `needs_attention` | 权限待决定（`permission_pending`）或 `blocked` | 是，**不代你同意** |
+| `uncertain` / `failed` / `cancelled` | 真实状态；`stop_certainty` 说明停止是否确定 | 是 |
+| `already_accepted` | 已验收任务，只读返回，记录不变 | 是 |
+| `wait_expired` | 等待窗口用尽，任务原样保留 | 否，用同一 ID 再 wait |
+| `attempt_changed` | 别的返工改了 attempt，本次不接收下一轮 | 是 |
+| `wait_cancelled` | 只停止观察，**不撤销任务** | 是 |
+| `not_found` | 该状态目录里没有这个任务 | 是 |
+
+- 等待绑定 `task + attempt`：外部返工改变 attempt 时返回 `attempt_changed`，不会把下一轮结果算进这一轮。
+- 超时只是 `wait_expired`：不取消任务、不重发提示词、不假装完成；任务自己的 `timeout_seconds` 仍然有效。
+- `active` 与未知状态不会被报成终态；`needs_review` 但未确认停止时继续等，不提前给“可验收”。
+- 同一条 MCP 连接上，长等待跑在**受控线程**里（最多 4 个并发），`ping`、`notifications/cancelled` 与只读查询照常响应；`notifications/cancelled` 只停止这一次等待，**不取消** WorkBuddy 任务。stdin 关闭时等待线程收到停止信号，进程正常退出，不写已关闭的 stdout。
+- 等待**不是验收**：返回只表示可以复核，`acceptance` 不变。
+
+### 宿主必须给足工具超时
+
+等待期间工具调用一直保持不返回，宿主的工具超时会先截断它：
+
+- `wait_seconds` 默认 900、上限 3600；`tool_timeout_sec` 要比它长，常见配置是 **1800** 或 **3600**，并让任务 `timeout_seconds` 与它有一致或明确的先后关系。
+- 参考 [MCP 扩展说明](https://learn.chatgpt.com/docs/extend/mcp) 与 `config-file/config-reference` 里的 `tool_timeout_sec`。默认 60 秒会截断等待：那是**宿主停止等待**，网关任务仍在跑；之后用同一 ID 再 `buddy_wait`，不要重发目标。
+- 本项目不改其他 MCP 接入配置，也不声称普通 MCP notification 能唤醒一个已经 final 结束的 Codex 聊天。这里支持的是“让这次工具调用一直开着不返回”，返回后由主 Agent 自己恢复。
+
+### 测量等待窗口
+
+```powershell
+python scripts/benchmark_wait.py --task-id TASK_ID --duration 120
+```
+
+它在同一个真实任务上同时取样：旧式定时 `get` 轮询的读取次数，与新等待路径的轮询次数、结果和是否一次结束。脚本自身**不提交任务、不调用模型**；输出的读取次数**不是** Token 节省，只有主 Agent 线程的 `token_count` 在窗口内不增长才能证明等待期没有新增计数。
 
 ## 用量分账
 
@@ -174,7 +220,7 @@ MCP 使用本地 stdio 入口。宿主可能从任意工作目录启动进程，
 python 'D:\Tools\workbuddy-manager-gateway\gateway.py' mcp
 ```
 
-工具：`buddy_doctor`、`buddy_status`、`buddy_submit`、`buddy_get`、`buddy_list`、`buddy_events`、`buddy_rework`、`buddy_approve`、`buddy_cancel`、`buddy_accept`、`buddy_resolve`、`buddy_usage`、`buddy_codex_usage`、`buddy_desktop_status`、`buddy_desktop_connect`、`buddy_desktop_launch`、`buddy_stop`。
+工具：`buddy_doctor`、`buddy_status`、`buddy_run`、`buddy_wait`、`buddy_rework_and_wait`、`buddy_submit`、`buddy_get`、`buddy_list`、`buddy_events`、`buddy_rework`、`buddy_approve`、`buddy_cancel`、`buddy_accept`、`buddy_resolve`、`buddy_usage`、`buddy_codex_usage`、`buddy_desktop_status`、`buddy_desktop_connect`、`buddy_desktop_launch`、`buddy_stop`。
 
 `buddy_submit` 的 `backend` 默认 `desktop_visible`；`cli_acp` 只是兼容模式。`buddy_get` 返回摘要，`full=true` 返回原始记录。本项目不会自动改写所有客户端的全局配置。
 
@@ -196,7 +242,7 @@ CI 覆盖 Windows、Ubuntu 的 Python 3.11/3.12 标准库测试，并对渲染�
 公开文件白名单见 [PUBLISH_MANIFEST.txt](docs/PUBLISH_MANIFEST.txt)，每行一个仓库相对路径。打包或上传前检查这些文件的实际内容，并核对清单已涵盖最终源文件与测试（含 `buddygate/desktop_console.mjs`、`buddygate/usage_ledger.py`、`scripts/check_desktop_helper.mjs` 与 `tests/test_usage_ledger.py`）。不要直接压缩整个工作目录；缓存、状态、任务日志、凭据和用户成果不属于发布内容。
 
 ```powershell
-python scripts/package.py --output '..\workbuddy-manager-gateway-0.3.1.zip'
+python scripts/package.py --output '..\workbuddy-manager-gateway-0.4.0.zip'
 python scripts/publish_to_github.py --owner VERIFIED_OWNER --repo workbuddy-manager-gateway --check
 ```
 

@@ -7,6 +7,7 @@ NOTICE.md
 README.md
 gateway.py
 pyproject.toml
+scripts/benchmark_wait.py
 scripts/check_desktop_helper.mjs
 scripts/package.py
 scripts/publish_to_github.py
@@ -28,6 +29,7 @@ buddygate/runtime.py
 buddygate/store.py
 buddygate/summary.py
 buddygate/usage_ledger.py
+buddygate/waiting.py
 buddygate/worker.py
 docs/ACCEPTANCE.md
 docs/COMPARISON.md
@@ -40,3 +42,4 @@ tests/test_gateway.py
 tests/test_native.py
 tests/test_store.py
 tests/test_usage_ledger.py
+tests/test_waiting.py

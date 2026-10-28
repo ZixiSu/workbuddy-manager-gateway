@@ -14,6 +14,7 @@ from .discovery import discover
 from .runtime import state_directory
 from .store import BACKEND_CLI, BACKEND_DESKTOP, Store
 from .summary import brief_task, summarize_status, summarize_task, usage_view
+from .waiting import DEFAULT_POLL_SECONDS, DEFAULT_WAIT_SECONDS, build_payload, exit_code, wait_for_task, wait_options
 
 
 def store() -> Store:
@@ -116,7 +117,31 @@ def desktop_launch(execute: bool = False) -> dict:
     return launch(DesktopConnection.load(), execute=execute)
 
 
-def invoke(name: str, args: dict):
+def wait_for_outcome(database: Store, task_id: str, mode: str, args: dict,
+                     cancel_event=None, attempt: int | None = None) -> dict:
+    """Read the local task record until it is reviewable or the wait expires.
+
+    The wait is bound to one attempt. Callers that just created or reworked the
+    task must pass the attempt they got back; without it the wait binds to the
+    attempt visible when the call starts, so a concurrent rework can never be
+    silently collected as this round's result. No model call happens here.
+    """
+    # Validate the wait options before anything else; a rejected value must not
+    # look like a failed wait after work was already dispatched.
+    wait_seconds, poll_interval = wait_options(args)
+    if attempt is None:
+        try:
+            attempt = database.get_task(task_id)["attempt"]
+        except (KeyError, ValueError):
+            attempt = None
+    report = wait_for_task(
+        database, task_id, attempt=attempt,
+        wait_seconds=wait_seconds, poll_interval=poll_interval,
+        cancel_event=cancel_event)
+    return build_payload(database, report, mode)
+
+
+def invoke(name: str, args: dict, cancel_event=None):
     if name == "buddy_doctor":
         return {"version": __version__, "executor": discover(),
                 "state_directory": str(state_directory()),
@@ -199,6 +224,23 @@ def invoke(name: str, args: dict):
         if args.get("start", True) and result["status"] == "queued":
             start_worker()
         return summarize_task(result)
+    if name == "buddy_run":
+        # One call: submit once, then wait locally. An idempotent repeat finds the
+        # same task and never dispatches a second prompt. The wait arguments are
+        # checked first so a bad value cannot leave a dispatched task behind with
+        # no ID handed back to the caller.
+        wait_options(args)
+        submitted = invoke("buddy_submit", args)
+        return wait_for_outcome(database, submitted["id"], name, args, cancel_event=cancel_event,
+                                attempt=submitted.get("attempt"))
+    if name == "buddy_wait":
+        return wait_for_outcome(database, args["task_id"], name, args,
+                                cancel_event=cancel_event, attempt=args.get("attempt"))
+    if name == "buddy_rework_and_wait":
+        wait_options(args)
+        reworked = invoke("buddy_rework", args)
+        return wait_for_outcome(database, reworked["id"], name, args, cancel_event=cancel_event,
+                                attempt=reworked.get("attempt"))
     if name == "buddy_get":
         task = database.get_task(args["task_id"])
         return task if args.get("full") else summarize_task(task)
@@ -242,6 +284,30 @@ def main():
                         help="desktop_visible (default) or the explicit cli_acp compatibility mode")
     submit.add_argument("--codex-thread", help="explicit Codex thread file used only for the manager-side usage snapshot")
     submit.add_argument("--no-start", action="store_true")
+    run = commands.add_parser("run", help="submit once and wait locally; no model call while waiting")
+    run.add_argument("--workspace", required=True)
+    run.add_argument("--objective", required=True)
+    run.add_argument("--constraint", action="append", default=[])
+    run.add_argument("--key")
+    run.add_argument("--model")
+    run.add_argument("--timeout", type=int, default=900)
+    run.add_argument("--backend", choices=[BACKEND_DESKTOP, BACKEND_CLI], default=BACKEND_DESKTOP)
+    run.add_argument("--codex-thread")
+    run.add_argument("--no-start", action="store_true")
+    run.add_argument("--wait-seconds", type=float, default=DEFAULT_WAIT_SECONDS,
+                     help="how long this call observes the local record; it never cancels the task")
+    run.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_SECONDS)
+    wait = commands.add_parser("wait", help="wait for an existing task; no model call")
+    wait.add_argument("task_id")
+    wait.add_argument("--attempt", type=int, help="bind the wait to one execution round")
+    wait.add_argument("--wait-seconds", type=float, default=DEFAULT_WAIT_SECONDS)
+    wait.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_SECONDS)
+    rework_wait = commands.add_parser("rework-and-wait", help="rework in the same conversation, then wait")
+    rework_wait.add_argument("task_id")
+    rework_wait.add_argument("--feedback", required=True)
+    rework_wait.add_argument("--no-start", action="store_true")
+    rework_wait.add_argument("--wait-seconds", type=float, default=DEFAULT_WAIT_SECONDS)
+    rework_wait.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_SECONDS)
     desktop_connect_command = commands.add_parser("desktop-connect")
     desktop_connect_command.add_argument("--executable", required=True)
     desktop_connect_command.add_argument("--port", type=int, required=True)
@@ -296,6 +362,26 @@ def main():
                           "start": not values["no_start"]}
             elif command == "rework":
                 values["start"] = not values.pop("no_start")
+            elif command in ("run", "wait", "rework-and-wait"):
+                if command == "run":
+                    request = {"workspace": values["workspace"], "objective": values["objective"],
+                               "constraints": values["constraint"], "idempotency_key": values["key"],
+                               "model": values["model"], "timeout_seconds": values["timeout"],
+                               "backend": values["backend"], "codex_thread": values["codex_thread"],
+                               "start": not values["no_start"]}
+                elif command == "wait":
+                    request = {"task_id": values["task_id"], "attempt": values["attempt"]}
+                else:
+                    request = {"task_id": values["task_id"], "feedback": values["feedback"],
+                               "start": not values.pop("no_start")}
+                request["wait_seconds"] = values["wait_seconds"]
+                request["poll_interval"] = values["poll_interval"]
+                tool = {"run": "buddy_run", "wait": "buddy_wait",
+                        "rework-and-wait": "buddy_rework_and_wait"}[command]
+                result = invoke(tool, request)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                # A wait that expired is not a failure of the WorkBuddy task.
+                raise SystemExit(exit_code(result.get("outcome")))
             elif command == "approve":
                 values["option_id"] = values.pop("option")
             elif command == "desktop-connect":
