@@ -1,8 +1,32 @@
 # 验收记录
 
-0.3.0 记录日期：2026-10-28。0.2.1、0.2.0 与 0.1.0 记录保留在文末。
+0.3.1 记录日期：2026-10-28。0.3.0、0.2.1、0.2.0 与 0.1.0 记录保留在本文。
 
-自动化、真实执行、内容检查与公开上传分别记录；不保存私人原始任务日志、账号配置或引导计划。**模拟测试通过不代表本机已连接，也不代表桌面通路已验收。** 本文件只记录主 Agent（WorkBuddy）自己跑出的证据；经理的独立核对与 `accept` 由经理完成，本轮未由主 Agent 调用 `buddy_accept`，0.3.0 也**未获经理整体验收**，未 commit、未 push。
+自动化、真实执行、内容检查与公开上传分别记录；不保存私人原始任务日志、账号配置或引导计划。**模拟测试通过不代表本机已连接，也不代表桌面通路已验收。** 证据按来源分列：**WorkBuddy 自测**是主 Agent 在本机实际跑出并自己看到的结果；**经理提供证据**由经理独立核对，本文只转述、不据为己有，也不补写成主 Agent 跑过。0.3.1 **尚未上传、尚未跑远端 CI**，也**未获经理整体验收**；本文未 commit、未 push。
+
+## 0.3.1：MCP stdio 固定 UTF-8 与发布行尾统一
+
+| # | 变更 | 实现边界 | WorkBuddy 自测证据 | 经理提供证据 |
+| --- | --- | --- | --- | --- |
+| 1 | 真实的 Windows MCP 兼容缺陷：`serve` 直接使用默认 `sys.stdin`/`sys.stdout` 编码，宿主强制 ASCII 时 UTF-8 请求解码失败，进程退出 1 且 stdout 无输出 | `buddygate/mcp.py` 新增 `_utf8(stream, errors)`，在读取第一条消息**之前**把 stdin/stdout/stderr 设为 UTF-8；没有 `reconfigure` 的流（`StringIO` 等测试替身）或已缓冲/已分离而拒绝改编码的流保持原样，不中断传输。stdin/stdout 用 `replace`（stdout 若用 `backslashreplace` 会产出非法 JSON 转义、破坏换行分帧），stderr 用 `backslashreplace` | `tests/test_gateway.py` 3 项新增：`test_stdio_mcp_stays_utf8_when_the_host_forces_a_narrow_encoding`（子进程带 `PYTHONIOENCODING=ascii`/`cp1252` + `PYTHONUTF8=0`，断言退出码 0、stdout 每行都是 JSON-RPC、中文与 emoji 原样回显）；`test_stdio_mcp_survives_an_undecodable_line`（一个坏字节只产生 JSON-RPC 错误，后续请求仍被应答）；`test_serve_tolerates_text_streams_that_cannot_reconfigure`（StringIO 与 `reconfigure` 抛 `ValueError` 的流）。旧实现下首项两个子用例均失败（退出 1，`'charmap' codec can't decode byte 0x8d`） | 缺陷与私有复现脚本 `work/check_mcp_utf8.py` 由经理提供；修复后**WorkBuddy 自己运行该脚本**得到 `utf8_mcp_under_non_utf8_host: true`、`exit_code: 0`、stdout 146 字节、无解码/编码错误——这不是经理本人跑的结果，0.3.1 也尚未经经理复核 |
+| 2 | 真实的发布行尾缺陷（由上传执行者发现、经理已读并认可纠错）：全局 `core.autocrlf=true` 使 `git diff --check` 只在规范化视图通过；为保证受审 SHA 字节原样上传而使用命令级 `autocrlf=false` 后，14 份 CRLF 文件使 `cached diff --check` 退出 2 | 发布清单原有 41 份文本统一为 UTF-8（原本均无 BOM，未新增 BOM）+ LF；新增 `.gitattributes` 内容为 `* text=auto eol=lf`；`.gitattributes` 加入清单，清单变为 42 项。只改行尾与该最小修复，无功能扩展 | 规范化脚本改动 **14 份**、剩余 CR **0**、非 UTF-8 **0**、BOM **0**；`git -c core.autocrlf=false diff --check` 对工作区当前字节退出 0；白名单打包 42 项且含 `.gitattributes` | 该缺陷、`autocrlf=false` 下的失败现象与“此前只在规范化视图通过”的纠错由上传执行者与经理提供。**本文不声称字节视图检查已通过**：未 `git add`，`--cached` 视图为空，不构成对提交 `9ee4e32…` 的字节复核结论 |
+
+行尾这条只说明工作区字节已无 CR、`diff --check` 对当前新字节退出 0；受审 SHA 的字节视图需要在暂存后由经理重新执行 `git -c core.autocrlf=false diff --cached --check` 才能下结论。已核对 `HEAD`（`9ee4e32…`）中这些文件确实以 CRLF 存入（例如 `buddygate/meter.py` 323 处、`tests/test_desktop.py` 1069 处），所以它们在本轮 diff 中表现为整文件行尾变更，属预期；其中 8 份除行尾外与 `HEAD` 逐字节一致（去掉 CR 后比较），另 7 份是本轮内容修改。
+
+真实证据只覆盖“stdin 读取与 stdout 写回 UTF-8”这一传输层；**注册工具后读取中文是否挂起是否完全由该编码问题引起，未验证，不作结论。**
+
+## 0.3.0 的独立证据（经理提供，本文只转述）
+
+| 项目 | 经理核对结果 |
+| --- | --- |
+| 自动化测试 | 138 项运行，137 通过，1 项跳过（本机不能创建符号链接的用例） |
+| 默认 MCP 派工 + 同聊天返工 | 种子文件字节不变；`sum18`/`count2`/`revision2` 正确；`task-536071c6-c60c-4000-bced-4b45d1ffa70c` 由经理 `accept` |
+| 逐轮计量与独立审计 | 5 轮数字与独立审计逐项相等 |
+| 上传与远端 CI | 由 WorkBuddy 可见上传任务 `task-39e37b18-96f5-4322-9f04-5581ae2ca3bc` 提交并推送 `9ee4e328fdf8203c555c8bd3c67651c5769a1498`；GitHub Actions 运行 `40673509938` 的四组（Windows/Ubuntu × Python 3.11/3.12）全部 success |
+| 发布字节核对 | 远端 41 blob、批准 SHA256 与 zip 41 项字节完全一致 |
+| 实际 `desktop-launch` | 实测通过，WorkBuddy 5.9.3 |
+
+以上均为经理独立核对，主 Agent 未参与该核对。本文此前把 0.3.0 写成“未获经理整体验收、未 commit/push”，与此不符，现更正为历史记录。
 
 ## 0.3.0：逐轮已落盘用量与请求身份恢复
 
@@ -34,26 +58,38 @@
 
 `rounds_without_usage=10`（有 `providerData` 但无 `usage` 的记录）、`parse_errors=0`、`compacted_records=0`、`invalid_fields=[]`、`completeness=all_recorded_rounds`。
 
-## 本轮质量门（0.3.0）
+## 本轮质量门（0.3.1，WorkBuddy 自测）
 
 | 项目 | 状态 | 证据 |
 | --- | --- | --- |
-| 全量 Python 测试 | 通过 | `python -m unittest discover -s tests` 共 **138 项通过，1 项跳过**（跳过项为本机不允许创建符号链接的链接拒绝用例），约 24.6 秒 |
+| 全量 Python 测试 | 通过 | `python -m unittest discover -s tests`：**141 项运行，140 通过，1 项跳过**（跳过项为本机不能创建符号链接的链接拒绝用例），约 26.4 秒 |
+| Node 语法与协议 | 通过 | `node --check buddygate/desktop_console.mjs`、`node scripts/check_desktop_helper.mjs` |
+| 白名单打包 | 通过 | `python scripts/package.py` → **42 个文件**（含 `.gitattributes`、`usage_ledger.py`、`test_usage_ledger.py`），无 `.pyc`/状态/日志；因本文件入包，sha256 以实际打包输出为准，不在此固定记录 |
+| 行尾与编码 | 通过（仅工作区字节） | 清单内 41 份文本均为 UTF-8（无 BOM）+ LF，剩余 CR 0、非 UTF-8 0；`git -c core.autocrlf=false diff --check` 对当前工作区字节退出 0。未 `git add`，`--cached` 为空，**不代表**受审 SHA 的字节视图已复核 |
+| 经理整体验收 | **未进行** | 0.3.1 未上传、未跑远端 CI、未调用 `buddy_accept`、未 commit/push |
+
+## 0.3.0 的质量门（WorkBuddy 自测，历史记录）
+
+| 项目 | 状态 | 证据 |
+| --- | --- | --- |
+| 全量 Python 测试 | 通过 | `python -m unittest discover -s tests`：**138 项运行，137 通过，1 项跳过**（跳过项为本机不允许创建符号链接的链接拒绝用例），约 24.6 秒。此前本表写作“138 项通过，1 项跳过”，把运行总数当成通过数，已按运行/通过/跳过分列；经理独立运行得到同一数量 |
 | Node 语法与协议 | 通过 | `node --check buddygate/desktop_console.mjs`、`node scripts/check_desktop_helper.mjs`（含 details/byCategory 白名单、活动三态、canonical 匹配与歧义拒绝） |
 | 白名单打包 | 通过 | `python scripts/package.py` → 41 个文件，`sha256 80cd713ef65b72d7…`，无 `.pyc`/状态/日志 |
-| probe 数字 | 通过 | 见上表，5 轮四类数字全部与报告一致 |
+| probe 数字 | 通过 | 见上表，5 轮四类数字全部与报告一致；经理的独立审计逐项相等 |
 | 已验收任务只读刷新 | 通过（保守不可用） | `task-536071c6-c60c-4000-bced-4b45d1ffa70c`：`stored=false`、`available=false`、未重发、记录未改；按经理要求未重跑、未再验收 |
-| 经理整体验收 | **未进行** | 本轮未调用 `buddy_accept`，也未 commit/push |
+| 经理侧结果 | 经理提供证据（非本次自测） | 见上方“0.3.0 的独立证据”：派工/返工内容核对、`accept`、上传字节核对与 CI 结果 |
 
-## 仍未验证（0.3.0，不得当成已通过）
+## 仍未验证（截至 0.3.1，不得当成已通过）
 
 - **真实桌面权限申请**的字段形状与真实载荷决议语义（仍只有模拟覆盖）。
 - **真实取消**完整链路，以及后台子任务导致的真实 `stop_unconfirmed`。
 - **真实长会话**：`max_rounds=512`、`max_bytes=32 MiB`、`max_line_bytes=256 KiB` 的截断分支只有模拟，没有真实超长会话。
 - **失败重试完整性**：模型调用失败/重试时是否留下 `usage` 记录、缺口如何表现，未在真实失败中观测。
-- **真实重启后继续观察**：仅验证了身份能保存、缺证据时保守不可用；跨进程“恢复观察”没有实现，也不在 0.3.0 承诺内。
+- **真实重启/崩溃后继续观察**：仅验证了身份能保存、缺证据时保守不可用；跨进程“恢复观察”没有实现，也不在承诺内。
 - 带真实 Codex 线程文件的计量（`usage.codex` 仍为 null）。
-- `desktop-launch --execute-launch` 的真实启动路径、远端 Windows/Ubuntu CI、公开上传。
+- 注册 MCP 工具后读取中文是否挂起及其根因：0.3.1 只证明传输层按 UTF-8 收发，不作因果结论。
+
+以下各项此前列为未验证，现已被经理提供的证据覆盖，仅保留作历史记录：`desktop-launch --execute-launch` 的真实启动路径（经理实测通过，WorkBuddy 5.9.3）、远端 Windows/Ubuntu CI（运行 `40673509938` 四组 success）、公开上传（`9ee4e32…`，远端 41 blob 与 zip 41 项字节一致）。**这些不适用于 0.3.1：0.3.1 自身尚未上传、尚未跑远端 CI。**
 
 ## 0.2.1 返工：六项有证据的问题
 

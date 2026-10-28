@@ -105,7 +105,33 @@ def validate_arguments(args, schema):
             raise ValueError(f"{key} must be an array of strings")
 
 
+def _utf8(stream, errors):
+    """Make one standard stream speak UTF-8 before any protocol byte is read.
+
+    MCP stdio is UTF-8 by specification, so the host's locale and
+    ``PYTHONIOENCODING`` must not decide it. Streams without ``reconfigure``
+    (in-process test doubles such as ``StringIO``) are left untouched, and a
+    stream that is already detached or buffered keeps its own encoding instead
+    of aborting the server.
+    """
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return
+    try:
+        reconfigure(encoding="utf-8", errors=errors)
+    except (AttributeError, OSError, ValueError):
+        return
+
+
 def serve():
+    # Configure before the first read. stdin replaces undecodable bytes so one
+    # malformed line becomes a JSON-RPC error instead of ending the connection;
+    # stdout replaces an unencodable lone surrogate, which keeps the
+    # newline-framed JSON parseable (a backslash escape would not); stderr is
+    # diagnostics only, never part of the protocol.
+    _utf8(sys.stdin, "replace")
+    _utf8(sys.stdout, "replace")
+    _utf8(sys.stderr, "backslashreplace")
     for line in sys.stdin:
         request_id = None
         try:

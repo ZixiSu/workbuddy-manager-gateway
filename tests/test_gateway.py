@@ -1,6 +1,7 @@
 """Protocol and executor checks use an isolated fake ACP child, never WorkBuddy."""
 
 import json
+import io
 import os
 from pathlib import Path
 import shutil
@@ -15,6 +16,7 @@ import uuid
 
 from buddygate.acp import AcpClient
 from buddygate.cli import approve_task
+from buddygate.mcp import serve
 from buddygate.store import Store
 from buddygate.worker import execute, safe_text
 
@@ -185,6 +187,78 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("error", replies[0])
         self.assertIn("error", replies[1])
         self.assertEqual(replies[-1]["result"], {})
+
+    def test_stdio_mcp_stays_utf8_when_the_host_forces_a_narrow_encoding(self):
+        # Reported defect: a Windows MCP host started the server with an ASCII
+        # stdio encoding, so the UTF-8 request failed to decode and the process
+        # exited 1 with nothing on stdout. The protocol stream, not the host
+        # locale, decides the encoding.
+        messages = [
+            {"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}},
+            {"jsonrpc":"2.0", "id":2, "method":"tools/call",
+             "params":{"name":"buddy_get", "arguments":{"task_id":"不存在的验收任务-🙂"}}},
+            {"jsonrpc":"2.0", "id":3, "method":"ping"},
+        ]
+        payload = "".join(json.dumps(message, ensure_ascii=False) + "\n" for message in messages).encode("utf-8")
+        for encoding in ("ascii", "cp1252"):
+            with self.subTest(encoding=encoding):
+                environment = os.environ.copy()
+                environment["BUDDYGATE_STATE_DIR"] = str(self.root / f"mcp-state-{encoding}")
+                environment["PYTHONIOENCODING"] = encoding
+                environment["PYTHONUTF8"] = "0"
+                process = subprocess.run([sys.executable, "-m", "buddygate", "mcp"], input=payload,
+                    capture_output=True, timeout=20, env=environment,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(process.returncode, 0, process.stderr.decode("utf-8", "replace"))
+                # Every stdout line must be a JSON-RPC reply: a diagnostic sent
+                # to the protocol stream would break the newline framing.
+                replies = {reply["id"]: reply
+                           for reply in map(json.loads, process.stdout.decode("utf-8").splitlines())}
+                self.assertEqual(set(replies), {1, 2, 3})
+                self.assertEqual(replies[1]["result"]["serverInfo"]["name"], "workbuddy-manager-gateway")
+                self.assertTrue(replies[2]["result"]["isError"])
+                self.assertIn("不存在的验收任务-🙂", replies[2]["result"]["content"][0]["text"])
+                self.assertEqual(replies[3]["result"], {})
+
+    def test_stdio_mcp_survives_an_undecodable_line(self):
+        # One malformed byte must not end the connection: it becomes a
+        # JSON-RPC error and the next request is still answered.
+        environment = os.environ.copy()
+        environment["BUDDYGATE_STATE_DIR"] = str(self.root / "mcp-state-bad-bytes")
+        environment["PYTHONIOENCODING"] = "ascii"
+        environment["PYTHONUTF8"] = "0"
+        payload = (b'{"jsonrpc":"2.0","id":1,"method":"\xff\xfe"}\n'
+                   + (json.dumps({"jsonrpc":"2.0", "id":2, "method":"ping"}) + "\n").encode("utf-8"))
+        process = subprocess.run([sys.executable, "-m", "buddygate", "mcp"], input=payload,
+            capture_output=True, timeout=20, env=environment,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertEqual(process.returncode, 0, process.stderr.decode("utf-8", "replace"))
+        replies = {reply["id"]: reply
+                   for reply in map(json.loads, process.stdout.decode("utf-8").splitlines())}
+        self.assertEqual(set(replies), {1, 2})
+        self.assertIn("error", replies[1])
+        self.assertEqual(replies[2]["result"], {})
+
+    def test_serve_tolerates_text_streams_that_cannot_reconfigure(self):
+        # In-process doubles (StringIO) have no reconfigure, and a stream that
+        # already buffered data refuses to change encoding. Neither may abort
+        # the transport; each keeps its own encoding.
+        class Buffered(io.StringIO):
+            def reconfigure(self, **kwargs):
+                raise ValueError("cannot reconfigure after reading")
+
+        packet = json.dumps({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"buddy_get", "arguments":{"task_id":"不存在的任务-🙂"}}}, ensure_ascii=False) + "\n"
+        for name, requests in (("plain_stringio", io.StringIO(packet)), ("reconfigure_refused", Buffered(packet))):
+            with self.subTest(stream=name):
+                output, diagnostics = io.StringIO(), io.StringIO()
+                with mock.patch.dict(os.environ, {"BUDDYGATE_STATE_DIR": str(self.root / f"mcp-state-{name}")}):
+                    with mock.patch("sys.stdin", requests), mock.patch("sys.stdout", output), \
+                            mock.patch("sys.stderr", diagnostics):
+                        serve()
+                reply = json.loads(output.getvalue())
+                self.assertIn("不存在的任务-🙂", reply["result"]["content"][0]["text"])
+                self.assertEqual(diagnostics.getvalue(), "")
 
     def test_real_acp_child_transports_messages_but_excludes_private_thought(self):
         task = self.task()

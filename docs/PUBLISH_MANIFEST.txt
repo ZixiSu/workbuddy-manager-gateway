@@ -1,4 +1,5 @@
 .github/workflows/test.yml
+.gitattributes
 .gitignore
 AGENTS.md
 LICENSE

@@ -1,6 +1,6 @@
 # WorkBuddy Manager Gateway
 
-让主 Agent 派工、检查成果和提出返工，让 WorkBuddy 在**真实可见的桌面聊天**里用自己的模型和工具执行。面向 Windows 的本地任务网关，版本 `0.3.0`。网关自有代码使用 Python 3.11+ 标准库；本地渲染器辅助脚本是项目自写的 Node ESM 文件（Node 22+ 内置 WebSocket）。
+让主 Agent 派工、检查成果和提出返工，让 WorkBuddy 在**真实可见的桌面聊天**里用自己的模型和工具执行。面向 Windows 的本地任务网关，版本 `0.3.1`。网关自有代码使用 Python 3.11+ 标准库；本地渲染器辅助脚本是项目自写的 Node ESM 文件（Node 22+ 内置 WebSocket）。
 
 ```text
 用户确定目标与授权
@@ -178,6 +178,8 @@ python 'D:\Tools\workbuddy-manager-gateway\gateway.py' mcp
 
 `buddy_submit` 的 `backend` 默认 `desktop_visible`；`cli_acp` 只是兼容模式。`buddy_get` 返回摘要，`full=true` 返回原始记录。本项目不会自动改写所有客户端的全局配置。
 
+stdio 传输固定使用 UTF-8：进程在读取第一条消息前就把标准输入/输出/错误设为 UTF-8，宿主设置 `PYTHONIOENCODING`（例如 `ascii`、`cp1252`）或关闭 UTF-8 模式都不会改变协议编码。协议 stdout 只写 JSON-RPC 回复，诊断只进 stderr。
+
 ## 开发检查
 
 ```powershell
@@ -194,7 +196,7 @@ CI 覆盖 Windows、Ubuntu 的 Python 3.11/3.12 标准库测试，并对渲染�
 公开文件白名单见 [PUBLISH_MANIFEST.txt](docs/PUBLISH_MANIFEST.txt)，每行一个仓库相对路径。打包或上传前检查这些文件的实际内容，并核对清单已涵盖最终源文件与测试（含 `buddygate/desktop_console.mjs`、`buddygate/usage_ledger.py`、`scripts/check_desktop_helper.mjs` 与 `tests/test_usage_ledger.py`）。不要直接压缩整个工作目录；缓存、状态、任务日志、凭据和用户成果不属于发布内容。
 
 ```powershell
-python scripts/package.py --output '..\workbuddy-manager-gateway-0.3.0.zip'
+python scripts/package.py --output '..\workbuddy-manager-gateway-0.3.1.zip'
 python scripts/publish_to_github.py --owner VERIFIED_OWNER --repo workbuddy-manager-gateway --check
 ```
 
